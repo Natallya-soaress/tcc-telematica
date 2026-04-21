@@ -57,10 +57,6 @@ def gerar_evento(driver_id, perfil, tempo):
         "perfil": perfil
     }
 
-
-# -------------------------------
-# CSV (TREINO)
-# -------------------------------
 def gerar_dados(qtd=1000):
 
     dados = []
@@ -91,9 +87,6 @@ def salvar_csv(dados, nome_arquivo="dados_telematicos.csv"):
     print(f"CSV salvo: {nome_arquivo}")
 
 
-# -------------------------------
-# API (PIPELINE)
-# -------------------------------
 def enviar_evento_api(evento):
     url = "http://localhost:8000/event"
 
@@ -107,9 +100,6 @@ def enviar_evento_api(evento):
         print(f"Erro ao enviar: {e}")
 
 
-# -------------------------------
-# MAIN
-# -------------------------------
 if __name__ == "__main__":
 
     modo = input("Escolha o modo (1 = CSV treino | 2 = Enviar API): ")
