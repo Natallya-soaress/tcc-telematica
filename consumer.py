@@ -1,177 +1,166 @@
-from kafka import KafkaConsumer
 import json
-import pandas as pd
-import joblib
-from collections import defaultdict
-
-from sqlalchemy import create_engine, Column, Integer, Float, String
-from sqlalchemy.orm import sessionmaker, declarative_base
-
 import time
-import psutil
 import csv
 import os
 
+from kafka import KafkaConsumer
+import tenseal as ts
+import psutil
+
+from config import USE_HE, KAFKA_TOPIC, KAFKA_SERVER
+from he_utils import context, decrypt_vector
+from db import salvar_resultado
+
+CSV_FILE = "metricas_he.csv" if USE_HE else "metricas_plain.csv"
+
+print(f"Consumer iniciado | HE={'ON' if USE_HE else 'OFF'}")
+
 consumer = KafkaConsumer(
-    bootstrap_servers="127.0.0.1:9092",
-    auto_offset_reset="earliest",
-    enable_auto_commit=True,
-    group_id="tcc-group-ml",
+    KAFKA_TOPIC,
+    bootstrap_servers=KAFKA_SERVER,
+    value_deserializer=lambda x: json.loads(x.decode("utf-8")),
+    auto_offset_reset="latest"
 )
 
-consumer.subscribe(["telematica"])
-print("Consumidor rodando...\n")
+WEIGHTS = [0.3, 0.2, 0.25, 0.15, 0.1]
+BIAS = 0.5
 
-DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/telematica"
-
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(bind=engine)
-Base = declarative_base()
+inicio_global = time.perf_counter()
+eventos_processados = 0
 
 
-class EventoDB(Base):
-    __tablename__ = "eventos"
-
-    id = Column(Integer, primary_key=True)
-    driver_id = Column(Integer)
-    timestamp = Column(String)
-    speed = Column(Float)
-    acceleration = Column(Float)
-    harsh_brake = Column(Integer)
-    distance = Column(Float)
-    is_night = Column(Integer)
-    score = Column(Float)
+def calcular_score_plain(valores):
+    return sum(v * w for v, w in zip(valores, WEIGHTS)) + BIAS
 
 
-Base.metadata.create_all(bind=engine)
+def calcular_score_he(enc_vector):
+    result = enc_vector.dot(WEIGHTS)
+    result += BIAS
+    return result
 
-try:
-    model = joblib.load("modelo_score.pkl")
-    print("Modelo carregado\n")
-except Exception as e:
-    print("Erro ao carregar modelo:", e)
-    exit()
 
-historico = defaultdict(list)
-
-start_global = time.time()
-contador_eventos = 0
-
-latencias = []
-tempos_score = []
-
-arquivo_metricas = "metricas.csv"
-
-if not os.path.exists(arquivo_metricas):
-    with open(arquivo_metricas, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "eventos",
-            "throughput",
-            "latencia_media",
-            "tempo_score_medio",
-            "cpu",
-            "memoria"
-        ])
-
-for msg in consumer:
-
-    inicio_evento = time.time()
-    contador_eventos += 1
-
-    try:
-        evento = json.loads(msg.value.decode("utf-8"))
-    except Exception as e:
-        print("Erro ao decodificar JSON:", e)
-        continue
-
-    driver_id = evento.get("driver_id")
-
-    if driver_id is None:
-        continue
-
-    historico[driver_id].append(evento)
-    df = pd.DataFrame(historico[driver_id])
-
-    if len(df) < 5:
-        continue
-
-    features = {
-        "freq_frenagem": df["harsh_brake"].mean(),
-        "velocidade_media": df["speed"].mean(),
-        "pct_noite": df["is_night"].mean(),
-        "aceleracao_media": df["acceleration"].mean()
-    }
-
-    X = pd.DataFrame([features])
-
-    try:
-        inicio_score = time.time()
-
-        score = model.predict(X)[0]
-
-        fim_score = time.time()
-
-        tempo_score = fim_score - inicio_score
-        tempos_score.append(tempo_score)
-
-        score = round(max(0, min(100, float(score))), 2)
-
-    except Exception as e:
-        print("Erro ao calcular score:", e)
-        continue
-
-    try:
-        db = SessionLocal()
-
-        novo = EventoDB(
-            driver_id=evento["driver_id"],
-            timestamp=evento["timestamp"],
-            speed=evento["speed"],
-            acceleration=evento["acceleration"],
-            harsh_brake=evento["harsh_brake"],
-            distance=evento["distance"],
-            is_night=evento["is_night"],
-            score=score
-        )
-
-        db.add(novo)
-        db.commit()
-        db.close()
-
-    except Exception as e:
-        print("Erro ao salvar no banco:", e)
-
-    fim_evento = time.time()
-    latencia = fim_evento - inicio_evento
-    latencias.append(latencia)
-
-    if contador_eventos % 10 == 0:
-
-        tempo_total = time.time() - start_global
-        throughput = contador_eventos / tempo_total
-
-        cpu = psutil.cpu_percent()
-        memoria = psutil.virtual_memory().percent
-
-        latencia_media = sum(latencias) / len(latencias)
-        tempo_score_medio = sum(tempos_score) / len(tempos_score)
-
-        print("\nMÉTRICAS:")
-        print(f"Eventos processados: {contador_eventos}")
-        print(f"Throughput: {throughput:.2f} eventos/seg")
-        print(f"Latência média: {latencia_media:.4f} s")
-        print(f"Tempo médio de score: {tempo_score_medio:.4f} s")
-        print(f"CPU: {cpu}%")
-        print(f"Memória: {memoria}%\n")
-
-        with open(arquivo_metricas, "a", newline="") as f:
+def inicializar_csv():
+    if not os.path.exists(CSV_FILE):
+        with open(CSV_FILE, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
-                contador_eventos,
-                round(throughput, 2),
-                round(latencia_media, 4),
-                round(tempo_score_medio, 4),
-                cpu,
-                memoria
+                "cenario",
+                "volume",
+                "carga",
+                "execucao",
+                "evento",
+                "latencia_total",
+                "tempo_processamento",
+                "tempo_cifragem",
+                "tempo_decifragem",
+                "throughput",
+                "cpu_percent",
+                "mem_percent",
+                "tamanho_payload"
             ])
+
+
+def salvar_metricas(linha):
+    with open(CSV_FILE, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(linha)
+
+
+inicializar_csv()
+
+for msg in consumer:
+    evento = msg.value
+
+    start_total = time.perf_counter()
+
+    driver_id = evento.get("driver_id")
+    timestamp = evento.get("timestamp")
+
+    tempo_cifragem = evento.get("tempo_cifragem", 0)
+    tempo_dec = 0
+    tamanho_payload = 0
+
+    cpu_before = psutil.cpu_percent()
+    mem_before = psutil.virtual_memory().percent
+
+    try:
+        if USE_HE:
+            payload_hex = evento["payload_encrypted"]
+            payload_bytes = bytes.fromhex(payload_hex)
+
+            tamanho_payload = len(payload_bytes)
+
+            enc_vector = ts.ckks_vector_from(context, payload_bytes)
+
+            start_proc = time.perf_counter()
+            enc_result = calcular_score_he(enc_vector)
+            end_proc = time.perf_counter()
+
+            score, tempo_dec = decrypt_vector(enc_result)
+            score = score[0]
+
+        else:
+            valores = [
+                evento["speed"],
+                evento["acceleration"],
+                evento["harsh_brake"],
+                evento["distance"],
+                evento["is_night"]
+            ]
+
+            start_proc = time.perf_counter()
+            score = calcular_score_plain(valores)
+            end_proc = time.perf_counter()
+
+        salvar_resultado(driver_id, score, timestamp)
+
+        end_total = time.perf_counter()
+
+        eventos_processados += 1
+
+        tempo_decorrido = end_total - inicio_global
+        throughput = eventos_processados / tempo_decorrido if tempo_decorrido > 0 else 0
+
+        cpu_after = psutil.cpu_percent()
+        mem_after = psutil.virtual_memory().percent
+
+        salvar_metricas([
+            "HE" if USE_HE else "PLAIN",
+            evento.get("teste_volume"),
+            evento.get("teste_carga"),
+            evento.get("teste_execucao"),
+            evento.get("teste_evento"),
+            end_total - start_total,
+            end_proc - start_proc,
+            tempo_cifragem,
+            tempo_dec,
+            throughput,
+            cpu_after,
+            mem_after,
+            tamanho_payload
+        ])
+
+        print(
+            f"Teste | HE={USE_HE} | "
+            f"Volume={evento.get('teste_volume')} | "
+            f"Carga={evento.get('teste_carga')} | "
+            f"Execução={evento.get('teste_execucao')} | "
+            f"Evento={evento.get('teste_evento')}\n"
+            f"Score={score:.4f}\n"
+            f"Latência={end_total-start_total:.6f}s\n"
+            f"Tempo processamento={end_proc-start_proc:.6f}s\n"
+            f"Throughput={throughput:.2f} eventos/s\n"
+            f"CPU={cpu_after:.2f}% | Memória={mem_after:.2f}%"
+        )
+
+        if USE_HE:
+            print(
+                f"Tempo cifragem={tempo_cifragem:.6f}s\n"
+                f"Tempo decifragem={tempo_dec:.6f}s\n"
+                f"Payload cifrado={tamanho_payload} bytes"
+            )
+
+        print("-" * 60)
+
+    except Exception as e:
+        print(f"Erro ao processar evento: {e}")

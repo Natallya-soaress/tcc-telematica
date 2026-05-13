@@ -1,36 +1,17 @@
 from fastapi import FastAPI
-from pydantic import BaseModel
 from kafka import KafkaProducer
 import json
+from config import KAFKA_SERVER, KAFKA_TOPIC
 
-app = FastAPI(title="API Telemática - TCC")
+app = FastAPI()
 
 producer = KafkaProducer(
-    bootstrap_servers="localhost:9092",
+    bootstrap_servers=KAFKA_SERVER,
     value_serializer=lambda v: json.dumps(v).encode("utf-8")
 )
 
-TOPIC = "telematica"
-
-class EventoTelemetrico(BaseModel):
-    driver_id: int
-    timestamp: str
-    speed: float
-    acceleration: float
-    harsh_brake: int
-    distance: float
-    is_night: int
-
-
-@app.get("/")
-def home():
-    return {"message": "API com Kafka 🚀"}
-
-
 @app.post("/event")
-def receber_evento(evento: EventoTelemetrico):
-
-    producer.send(TOPIC, evento.dict())
+def receber_evento(evento: dict):
+    producer.send(KAFKA_TOPIC, evento)
     producer.flush()
-
-    return {"status": "enviado para fila (Kafka)"}
+    return {"status": "ok"}
